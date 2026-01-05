@@ -335,7 +335,7 @@ class ArxivPaper:
                         m
                         for m in tar.getmembers()
                         if m.isfile()
-                        and m.name.lower().endswith((".png", ".jpg", ".jpeg"))
+                        and m.name.lower().endswith((".png", ".jpg", ".jpeg", ".pdf"))
                     ]
 
                     if not image_files:
@@ -367,7 +367,7 @@ class ArxivPaper:
                             # img.name is like "directory/figure.png"
                             # selected_fig_name is like "figure.pdf"
                             img_base = re.sub(
-                                r"\.(png|jpg|jpeg)$",
+                                r"\.(png|jpg|jpeg|pdf)$",
                                 "",
                                 img.name.split("/")[-1],
                                 flags=re.IGNORECASE,
@@ -398,7 +398,30 @@ class ArxivPaper:
 
                     f = tar.extractfile(target_member)
                     if f:
-                        return f.read()
+                        content = f.read()
+                        if target_member.name.lower().endswith(".pdf"):
+                            try:
+                                from pdf2image import convert_from_bytes
+
+                                images = convert_from_bytes(content)
+                                if images:
+                                    # Convert first page to PNG bytes
+                                    import io
+
+                                    img_byte_arr = io.BytesIO()
+                                    images[0].save(img_byte_arr, format="PNG")
+                                    return img_byte_arr.getvalue()
+                            except ImportError:
+                                logger.warning(
+                                    "pdf2image not installed, skipping PDF conversion."
+                                )
+                                return None
+                            except Exception as e:
+                                logger.error(
+                                    f"Error converting PDF {target_member.name}: {e}"
+                                )
+                                return None
+                        return content
             except Exception as e:
                 logger.error(f"Error extracting image for {self.arxiv_id}: {e}")
                 return None

@@ -268,15 +268,14 @@ def run_hf_daily_flow(args):
     """
     import datetime
 
-    # Use yesterday's date if not specified, or today?
-    # User said "obtain previous day's daily_papers".
-    # If running today (Jan 5), we likely want Jan 4?
-    # Or just use the date passed or default to "yesterday".
-    # Let's default to yesterday as per request "前一日".
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    today = datetime.date.today()
+    if today.weekday() == 0:
+        logger.info("Today is Monday, setting target date to last Friday.")
+        yesterday = (today - datetime.timedelta(days=3)).isoformat()
+    else:
+        yesterday = (today - datetime.timedelta(days=1)).isoformat()
+
     logger.info(f"Fetching HuggingFace Daily Papers for {yesterday}...")
-    if args.date:
-        yesterday = args.date
     # Initialize Arxiv Client
     client = arxiv.Client()
 

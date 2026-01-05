@@ -344,13 +344,57 @@ class ArxivPaper:
                         )
                         return None
 
-                    # Sort by size (largest first) -> heuristic for "main figure"
-                    image_files.sort(key=lambda x: x.size, reverse=True)
-                    target_member = image_files[0]
+                    # Check for LLM selected figure
+                    target_member = None
+                    selected_fig_name = self.bilingual_summary.get("selected_figure")
 
-                    logger.debug(
-                        f"Found largest image: {target_member.name} ({target_member.size} bytes)"
-                    )
+                    if selected_fig_name:
+                        # Normalize name (remove extension, etc. to match available files)
+                        # Latex might say "figures/model.pdf", tar might have "figures/model.png"
+                        base_name = re.sub(
+                            r"\.(pdf|eps|png|jpg|jpeg)$",
+                            "",
+                            selected_fig_name,
+                            flags=re.IGNORECASE,
+                        )
+                        base_name = base_name.split("/")[
+                            -1
+                        ]  # Handle paths like "imgs/fig1" -> "fig1"? No, tar names are full paths.
+                        # Actually, better to checks if any tar member name CONTAINS the base_name
+
+                        # Let's try to match loosely
+                        for img in image_files:
+                            # img.name is like "directory/figure.png"
+                            # selected_fig_name is like "figure.pdf"
+                            img_base = re.sub(
+                                r"\.(png|jpg|jpeg)$",
+                                "",
+                                img.name.split("/")[-1],
+                                flags=re.IGNORECASE,
+                            )
+                            sel_base = re.sub(
+                                r"\.(pdf|eps|png|jpg|jpeg)$",
+                                "",
+                                selected_fig_name.split("/")[-1],
+                                flags=re.IGNORECASE,
+                            )
+
+                            if img_base == sel_base:
+                                target_member = img
+                                logger.info(
+                                    f"LLM selected figure found in source: {img.name}"
+                                )
+                                break
+
+                    if target_member is None:
+                        # Fallback: Sort by size (largest first) -> heuristic for "main figure"
+                        image_files.sort(key=lambda x: x.size, reverse=True)
+                        target_member = image_files[0]
+                        logger.debug(
+                            f"Using fallback largest image: {target_member.name} ({target_member.size} bytes)"
+                        )
+
+                    logger.debug(f"Extracting image: {target_member.name}")
 
                     f = tar.extractfile(target_member)
                     if f:
@@ -402,6 +446,18 @@ class ArxivPaper:
         if conclusion:
             context_text += f"Conclusion: {conclusion[:2000]}\n"
 
+        # Extract figures for selection
+        figures = []
+        if self.tex and self.tex.get("all"):
+            figures = self._extract_figures_from_tex(self.tex.get("all"))
+
+        figures_text = ""
+        if figures:
+            figures_text = "Figures found in paper:\n" + json.dumps(figures, indent=2)
+            figures_text += "\n\nPlease select the most representative figure file from the list above. Return its filename in the 'selected_figure' field. If no figure is suitable or the list is empty, return None."
+        else:
+            figures_text = "No figures extraction from latex source."
+
         llm = get_llm()
         prompt = (
             """
@@ -411,10 +467,15 @@ class ArxivPaper:
         - "problem": {"cn": "...", "en": "..."}  (The specific problem or gap this paper addresses)
         - "solution": {"cn": "...", "en": "..."} (The core method or approach proposed)
         - "result": {"cn": "...", "en": "..."}   (The main results, performance, or contribution)
+        - "selected_figure": "filename" or null (The filename of the most representative figure, e.g. "fig1.pdf", chosen from the provided list based on captions)
         
         Keep the descriptions concise (1-2 sentences each). 
         Do not use markdown code blocks, just raw JSON string.
-
+        
+        """
+            + figures_text
+            + """
+        
         Paper Content:
         """
             + context_text
@@ -438,7 +499,35 @@ class ArxivPaper:
                 f"Failed to generate bilingual summary for {self.arxiv_id}: {e}"
             )
             return {
-                "problem": {"cn": "生成失败", "en": "Generation Failed"},
-                "solution": {"cn": "生成失败", "en": "Generation Failed"},
                 "result": {"cn": "生成失败", "en": "Generation Failed"},
+                "selected_figure": None,
             }
+
+    def _extract_figures_from_tex(self, content: str) -> list[dict]:
+        """
+        Extract figure environments from LaTeX source.
+        Returns a list of dicts: {'file': 'filename', 'caption': 'caption text'}
+        """
+        figures = []
+        # Regex to find figure environments (non-greedy)
+        # Handles \begin{figure} ... \end{figure}
+        # Note: This is a basic regex and might fail on nested or complex latex.
+        fig_blocks = re.findall(
+            r"\\begin\{figure\*?\}(.*?)\\end\{figure\*?\}", content, flags=re.DOTALL
+        )
+
+        for block in fig_blocks:
+            # Extract caption
+            caption_match = re.search(r"\\caption\{(.*?)\}", block, flags=re.DOTALL)
+            caption = caption_match.group(1).strip() if caption_match else ""
+            # Clean caption (remove label case, simple tex cleanup)
+            caption = re.sub(r"[\n\r\t]+", " ", caption)
+
+            # Extract graphics file
+            # \includegraphics[opt]{filename} or \includegraphics{filename}
+            img_match = re.search(r"\\includegraphics(?:\[.*?\])?\{(.*?)\}", block)
+            if img_match:
+                filename = img_match.group(1).strip()
+                figures.append({"file": filename, "caption": caption})
+
+        return figures

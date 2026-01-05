@@ -292,9 +292,8 @@ def run_hf_daily_flow(args):
     logger.info(f"Found {len(hf_data)} papers from HF.")
 
     papers_to_process = []
-    # Limit to top 5 or so? HF daily usually has ~10-20. Let's process top 5 for cost/time?
-    # User didn't specify limit, but let's stick to a reasonable number.
-    hf_data = hf_data[:5]
+
+    hf_data = hf_data[:10] if len(hf_data) > 10 else hf_data
 
     for item in tqdm(hf_data, desc="Processing HF Papers"):
         p_meta = item["paper"]

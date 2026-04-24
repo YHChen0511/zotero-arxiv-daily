@@ -5,6 +5,7 @@ import arxiv
 import tarfile
 import re
 import time
+import io
 from llm import get_llm
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -79,32 +80,46 @@ class ArxivPaper:
         return repo_list["results"][0]["url"]
 
     @cached_property
-    def tex(self) -> dict[str, str]:
+    def source_archive_content(self) -> Optional[bytes]:
         with ExitStack() as stack:
             tmpdirname = stack.enter_context(TemporaryDirectory())
-            # file = self._paper.download_source(dirpath=tmpdirname)
             try:
-                # 尝试下载源文件
-                file = self._paper.download_source(dirpath=tmpdirname)
+                source_path = self._paper.download_source(dirpath=tmpdirname)
             except HTTPError as e:
-                # 捕获 HTTP 错误
                 if e.code == 404:
-                    # 如果是 404 Not Found，说明源文件不存在，这是正常情况
                     logger.warning(
                         f"Source for {self.arxiv_id} not found (404). Skipping source analysis."
                     )
-                    return None  # 直接返回 None，后续依赖 tex 的代码会安全地处理
-                else:
-                    # 如果是其他 HTTP 错误 (如 503)，这可能是临时性问题，值得记录下来
-                    logger.error(
-                        f"HTTP Error {e.code} when downloading source for {self.arxiv_id}: {e.reason}"
-                    )
-                    raise  # 重新抛出异常，因为这可能是个需要关注的严重问题
+                    return None
+
+                logger.error(
+                    f"HTTP Error {e.code} when downloading source for {self.arxiv_id}: {e.reason}"
+                )
+                raise
             except Exception as e:
                 logger.error(f"Error when downloading source for {self.arxiv_id}: {e}")
                 return None
+
             try:
-                tar = stack.enter_context(tarfile.open(file))
+                with open(source_path, "rb") as file:
+                    return file.read()
+            except Exception as e:
+                logger.error(
+                    f"Error when reading source archive for {self.arxiv_id}: {e}"
+                )
+                return None
+
+    @cached_property
+    def tex(self) -> dict[str, str]:
+        source_content = self.source_archive_content
+        if source_content is None:
+            return None
+
+        with ExitStack() as stack:
+            try:
+                tar = stack.enter_context(
+                    tarfile.open(fileobj=io.BytesIO(source_content), mode="r:*")
+                )
             except tarfile.ReadError:
                 logger.debug(
                     f"Failed to find main tex file of {self.arxiv_id}: Not a tar file."
@@ -309,122 +324,106 @@ class ArxivPaper:
         Returns the binary content of the image, or None if not found/error.
         """
         logger.info(f"Attempting to extract figure for {self.arxiv_id}...")
-        with ExitStack() as stack:
-            tmpdirname = stack.enter_context(TemporaryDirectory())
-            try:
-                # Reuse the download_source logic (or rely on cached if efficient, but here we redownload/open)
-                # Note: modifying existing download_source to be reusable would be better, but sticking to additive changes for now.
-                # However, calling download_source inside download_source context might be tricky if not careful.
-                # Let's perform a standalone source interaction here to be safe and isolated.
+        source_content = self.source_archive_content
+        if source_content is None:
+            return None
 
-                # Check if we can access the source file directly?
-                # self._paper.download_source downloads to a path.
-                source_path = self._paper.download_source(dirpath=tmpdirname)
-            except Exception as e:
-                logger.debug(f"Could not download source for image extraction: {e}")
-                return None
+        try:
+            with tarfile.open(fileobj=io.BytesIO(source_content), mode="r:*") as tar:
+                # Find all image files
+                image_files = [
+                    m
+                    for m in tar.getmembers()
+                    if m.isfile()
+                    and m.name.lower().endswith((".png", ".jpg", ".jpeg", ".pdf"))
+                ]
 
-            try:
-                if not tarfile.is_tarfile(source_path):
-                    logger.debug(f"Source for {self.arxiv_id} is not a tar file.")
+                if not image_files:
+                    logger.debug(f"No image files found in source for {self.arxiv_id}.")
                     return None
 
-                with tarfile.open(source_path) as tar:
-                    # Find all image files
-                    image_files = [
-                        m
-                        for m in tar.getmembers()
-                        if m.isfile()
-                        and m.name.lower().endswith((".png", ".jpg", ".jpeg", ".pdf"))
-                    ]
+                # Check for LLM selected figure
+                target_member = None
+                selected_fig_name = self.bilingual_summary.get("selected_figure")
 
-                    if not image_files:
-                        logger.debug(
-                            f"No image files found in source for {self.arxiv_id}."
-                        )
-                        return None
+                if selected_fig_name:
+                    # Normalize name (remove extension, etc. to match available files)
+                    # Latex might say "figures/model.pdf", tar might have "figures/model.png"
+                    base_name = re.sub(
+                        r"\.(pdf|eps|png|jpg|jpeg)$",
+                        "",
+                        selected_fig_name,
+                        flags=re.IGNORECASE,
+                    )
+                    base_name = base_name.split("/")[
+                        -1
+                    ]  # Handle paths like "imgs/fig1" -> "fig1"? No, tar names are full paths.
+                    # Actually, better to checks if any tar member name CONTAINS the base_name
 
-                    # Check for LLM selected figure
-                    target_member = None
-                    selected_fig_name = self.bilingual_summary.get("selected_figure")
-
-                    if selected_fig_name:
-                        # Normalize name (remove extension, etc. to match available files)
-                        # Latex might say "figures/model.pdf", tar might have "figures/model.png"
-                        base_name = re.sub(
-                            r"\.(pdf|eps|png|jpg|jpeg)$",
+                    # Let's try to match loosely
+                    for img in image_files:
+                        # img.name is like "directory/figure.png"
+                        # selected_fig_name is like "figure.pdf"
+                        img_base = re.sub(
+                            r"\.(png|jpg|jpeg|pdf)$",
                             "",
-                            selected_fig_name,
+                            img.name.split("/")[-1],
                             flags=re.IGNORECASE,
                         )
-                        base_name = base_name.split("/")[
-                            -1
-                        ]  # Handle paths like "imgs/fig1" -> "fig1"? No, tar names are full paths.
-                        # Actually, better to checks if any tar member name CONTAINS the base_name
-
-                        # Let's try to match loosely
-                        for img in image_files:
-                            # img.name is like "directory/figure.png"
-                            # selected_fig_name is like "figure.pdf"
-                            img_base = re.sub(
-                                r"\.(png|jpg|jpeg|pdf)$",
-                                "",
-                                img.name.split("/")[-1],
-                                flags=re.IGNORECASE,
-                            )
-                            sel_base = re.sub(
-                                r"\.(pdf|eps|png|jpg|jpeg)$",
-                                "",
-                                selected_fig_name.split("/")[-1],
-                                flags=re.IGNORECASE,
-                            )
-
-                            if img_base == sel_base:
-                                target_member = img
-                                logger.info(
-                                    f"LLM selected figure found in source: {img.name}"
-                                )
-                                break
-
-                    if target_member is None:
-                        # Fallback: Sort by size (largest first) -> heuristic for "main figure"
-                        image_files.sort(key=lambda x: x.size, reverse=True)
-                        target_member = image_files[0]
-                        logger.debug(
-                            f"Using fallback largest image: {target_member.name} ({target_member.size} bytes)"
+                        sel_base = re.sub(
+                            r"\.(pdf|eps|png|jpg|jpeg)$",
+                            "",
+                            selected_fig_name.split("/")[-1],
+                            flags=re.IGNORECASE,
                         )
 
-                    logger.debug(f"Extracting image: {target_member.name}")
+                        if img_base == sel_base:
+                            target_member = img
+                            logger.info(
+                                f"LLM selected figure found in source: {img.name}"
+                            )
+                            break
 
-                    f = tar.extractfile(target_member)
-                    if f:
-                        content = f.read()
-                        if target_member.name.lower().endswith(".pdf"):
-                            try:
-                                from pdf2image import convert_from_bytes
+                if target_member is None:
+                    # Fallback: Sort by size (largest first) -> heuristic for "main figure"
+                    image_files.sort(key=lambda x: x.size, reverse=True)
+                    target_member = image_files[0]
+                    logger.debug(
+                        f"Using fallback largest image: {target_member.name} ({target_member.size} bytes)"
+                    )
 
-                                images = convert_from_bytes(content)
-                                if images:
-                                    # Convert first page to PNG bytes
-                                    import io
+                logger.debug(f"Extracting image: {target_member.name}")
 
-                                    img_byte_arr = io.BytesIO()
-                                    images[0].save(img_byte_arr, format="PNG")
-                                    return img_byte_arr.getvalue()
-                            except ImportError:
-                                logger.warning(
-                                    "pdf2image not installed, skipping PDF conversion."
-                                )
-                                return None
-                            except Exception as e:
-                                logger.error(
-                                    f"Error converting PDF {target_member.name}: {e}"
-                                )
-                                return None
-                        return content
-            except Exception as e:
-                logger.error(f"Error extracting image for {self.arxiv_id}: {e}")
-                return None
+                f = tar.extractfile(target_member)
+                if f:
+                    content = f.read()
+                    if target_member.name.lower().endswith(".pdf"):
+                        try:
+                            from pdf2image import convert_from_bytes
+
+                            images = convert_from_bytes(content)
+                            if images:
+                                # Convert first page to PNG bytes
+                                img_byte_arr = io.BytesIO()
+                                images[0].save(img_byte_arr, format="PNG")
+                                return img_byte_arr.getvalue()
+                        except ImportError:
+                            logger.warning(
+                                "pdf2image not installed, skipping PDF conversion."
+                            )
+                            return None
+                        except Exception as e:
+                            logger.error(
+                                f"Error converting PDF {target_member.name}: {e}"
+                            )
+                            return None
+                    return content
+        except tarfile.ReadError:
+            logger.debug(f"Source for {self.arxiv_id} is not a tar file.")
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting image for {self.arxiv_id}: {e}")
+            return None
         return None
 
     @cached_property

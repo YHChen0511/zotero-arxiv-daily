@@ -331,10 +331,51 @@ def run_hf_daily_flow(args):
 
     hf_data = hf_data[:10] if len(hf_data) > 10 else hf_data
 
-    for item in tqdm(hf_data, desc="Processing HF Papers"):
-        p_meta = item["paper"]
+    def normalize_arxiv_id(arxiv_id: str) -> str:
+        return re.sub(r"v\d+$", "", str(arxiv_id).strip())
+
+    hf_items = []
+    for item in hf_data:
+        p_meta = item.get("paper", {})
         arxiv_id = p_meta.get("id")
         if not arxiv_id:
+            continue
+        hf_items.append((p_meta, arxiv_id))
+
+    if not hf_items:
+        logger.info("No valid arXiv IDs found in HuggingFace daily papers.")
+        return
+
+    unique_arxiv_ids = list(dict.fromkeys(arxiv_id for _, arxiv_id in hf_items))
+    logger.info(
+        f"Fetching arXiv metadata in batches for {len(unique_arxiv_ids)} papers..."
+    )
+
+    arxiv_results = {}
+    batch_size = 20
+    for i in tqdm(
+        range(0, len(unique_arxiv_ids), batch_size), desc="Fetching Arxiv Metadata"
+    ):
+        batch_ids = unique_arxiv_ids[i : i + batch_size]
+        try:
+            search = arxiv.Search(id_list=batch_ids)
+            results = list(client.results(search))
+        except Exception as e:
+            logger.error(f"Failed to fetch arXiv metadata for batch {batch_ids}: {e}")
+            continue
+
+        for result in results:
+            short_id = result.get_short_id()
+            normalized_short_id = normalize_arxiv_id(short_id)
+            arxiv_results[short_id] = result
+            arxiv_results[normalized_short_id] = result
+
+    for p_meta, arxiv_id in tqdm(hf_items, desc="Processing HF Papers"):
+        normalized_arxiv_id = normalize_arxiv_id(arxiv_id)
+        result = arxiv_results.get(arxiv_id) or arxiv_results.get(normalized_arxiv_id)
+
+        if result is None:
+            logger.warning(f"Arxiv ID {arxiv_id} not found in Arxiv API.")
             continue
 
         # Create ArxivPaper object to reuse logic (cache, source download)
@@ -343,12 +384,7 @@ def run_hf_daily_flow(args):
         # but ArxivPaper expects an arxiv.Result.
         # Let's fetch the actual arxiv result to ensure consistency and use ArxivPaper methods transparently.
         try:
-            search = arxiv.Search(id_list=[arxiv_id])
-            results = list(client.results(search))
-            if not results:
-                logger.warning(f"Arxiv ID {arxiv_id} not found in Arxiv API.")
-                continue
-            paper_obj = ArxivPaper(results[0])
+            paper_obj = ArxivPaper(result)
 
             # Use HF upvotes as score
             paper_obj.score = p_meta.get("upvotes", 0)

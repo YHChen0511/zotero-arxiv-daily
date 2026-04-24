@@ -170,6 +170,9 @@ def get_hf_block_html(
             <div class="paper-title" style="margin: 0; font-size: 18px; font-weight: 700; color: #2c3e50; line-height: 1.4;">
                 {title}
             </div>
+            <div class="paper-keywords" style="margin-top: 8px;">
+                {keywords}
+            </div>
             <div class="paper-meta" style="font-size: 13px; color: #7f8c8d; margin-top: 6px; display: flex; align-items: center; gap: 10px;">
                 <span class="paper-badge" style="background-color: #e0f7fa; color: #006064; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase;">Arxiv: {arxiv_id}</span>
                 <span>🔥 {score} Upvotes</span>
@@ -192,11 +195,6 @@ def get_hf_block_html(
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
                 <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">🚀 Key Result / 主要结果</span>
                 {result}
-            </div>
-
-            <div class="summary-section" style="margin-bottom: 8px; padding-bottom: 4px;">
-                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">🏷️ Keywords / 关键词</span>
-                {keywords}
             </div>
         </div>
         <div class="paper-footer" style="padding: 12px 20px; background-color: #fdfdfd; border-top: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center;">
@@ -380,29 +378,21 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
                 cn_keywords = shared_keywords
                 en_keywords = shared_keywords
 
-            cn_badges = render_keyword_badges(
-                cn_keywords,
+            merged_keywords = []
+            seen = set()
+            for keyword in cn_keywords + en_keywords:
+                key = keyword.lower()
+                if key not in seen:
+                    merged_keywords.append(keyword)
+                    seen.add(key)
+
+            badges = render_keyword_badges(
+                merged_keywords,
                 bg_color="#fff4db",
                 text_color="#8a5a00",
                 border_color="#f2d299",
             )
-            en_badges = render_keyword_badges(
-                en_keywords,
-                bg_color="#eaf4ff",
-                text_color="#0f4c81",
-                border_color="#c4ddf7",
-            )
-
-            return (
-                '<div style="margin-bottom: 8px;">'
-                '<div style="font-size: 11px; font-weight: 700; color: #7f8c8d; margin-bottom: 4px;">CN</div>'
-                f"<div>{cn_badges}</div>"
-                "</div>"
-                '<div>'
-                '<div style="font-size: 11px; font-weight: 700; color: #7f8c8d; margin-bottom: 4px;">EN</div>'
-                f"<div>{en_badges}</div>"
-                "</div>"
-            )
+            return f'<div style="line-height: 1.4;">{badges}</div>'
 
         author_str = ", ".join(p.get("authors", []))
 

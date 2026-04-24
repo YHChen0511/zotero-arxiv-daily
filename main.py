@@ -444,8 +444,9 @@ def run_hf_daily_flow(args):
 
     # Render Email
     html, attachments = render_hf_email(papers_to_process, yesterday)
-    with open("test.html", "w", encoding="utf-8") as f:
-        f.write(html)
+    if getattr(args, "debug", False) is True:
+        with open("test.html", "w", encoding="utf-8") as f:
+            f.write(html)
     # Send Email
     subject = f"HuggingFace Daily Papers {yesterday}"
     logger.info(f"Sending HF Daily Email: {subject}...")

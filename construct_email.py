@@ -7,6 +7,7 @@ from email.utils import parseaddr, formataddr
 import smtplib
 import datetime
 import time
+import html
 from loguru import logger
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
@@ -349,6 +350,25 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
                     normalized.append(text)
             return normalized
 
+        def render_keyword_badges(keyword_list, bg_color, text_color, border_color):
+            if not keyword_list:
+                return (
+                    '<span style="display: inline-block; padding: 3px 10px; border-radius: 999px; '
+                    f'background-color: {bg_color}; color: {text_color}; border: 1px dashed {border_color}; '
+                    'font-size: 12px; font-weight: 600; opacity: 0.7;">N/A</span>'
+                )
+
+            return "".join(
+                (
+                    '<span style="display: inline-block; margin: 0 8px 8px 0; padding: 4px 10px; '
+                    f'background-color: {bg_color}; color: {text_color}; border: 1px solid {border_color}; '
+                    'border-radius: 999px; font-size: 12px; font-weight: 700;">'
+                    f"{html.escape(keyword)}"
+                    "</span>"
+                )
+                for keyword in keyword_list
+            )
+
         def format_keywords():
             data = p.get("bilingual_summary", {}).get("keywords", {})
 
@@ -360,9 +380,29 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
                 cn_keywords = shared_keywords
                 en_keywords = shared_keywords
 
-            cn_text = "、".join(cn_keywords) if cn_keywords else "N/A"
-            en_text = ", ".join(en_keywords) if en_keywords else "N/A"
-            return f'<div class="text-cn">{cn_text}</div><div class="text-en">{en_text}</div>'
+            cn_badges = render_keyword_badges(
+                cn_keywords,
+                bg_color="#fff4db",
+                text_color="#8a5a00",
+                border_color="#f2d299",
+            )
+            en_badges = render_keyword_badges(
+                en_keywords,
+                bg_color="#eaf4ff",
+                text_color="#0f4c81",
+                border_color="#c4ddf7",
+            )
+
+            return (
+                '<div style="margin-bottom: 8px;">'
+                '<div style="font-size: 11px; font-weight: 700; color: #7f8c8d; margin-bottom: 4px;">CN</div>'
+                f"<div>{cn_badges}</div>"
+                "</div>"
+                '<div>'
+                '<div style="font-size: 11px; font-weight: 700; color: #7f8c8d; margin-bottom: 4px;">EN</div>'
+                f"<div>{en_badges}</div>"
+                "</div>"
+            )
 
         author_str = ", ".join(p.get("authors", []))
 

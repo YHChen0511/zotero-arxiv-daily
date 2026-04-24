@@ -18,6 +18,7 @@ arxiv.Result._get_pdf_url = _get_pdf_url_patch
 import argparse
 import os
 import sys
+import re
 from dotenv import load_dotenv
 import requests
 
@@ -257,6 +258,41 @@ def get_hf_daily_papers(date: str) -> list[dict]:
     return response.json()
 
 
+def _normalize_hf_keywords(raw_value) -> list[str]:
+    if raw_value is None:
+        return []
+
+    candidates = []
+    if isinstance(raw_value, str):
+        candidates = re.split(r"[,;|/\n，、]+", raw_value)
+    elif isinstance(raw_value, dict):
+        candidates = list(raw_value.values())
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, str):
+                candidates.append(item)
+            elif isinstance(item, dict):
+                value = None
+                for key in ("name", "label", "tag", "id"):
+                    if isinstance(item.get(key), str):
+                        value = item.get(key)
+                        break
+                if value is not None:
+                    candidates.append(value)
+            elif item is not None:
+                candidates.append(str(item))
+    else:
+        candidates = [str(raw_value)]
+
+    normalized = []
+    for keyword in candidates:
+        text = str(keyword).strip()
+        if text and text.lower() not in {"none", "null", "n/a"}:
+            normalized.append(text)
+
+    return list(dict.fromkeys(normalized))
+
+
 def run_hf_daily_flow(args):
     """
     Execute the HuggingFace Daily Papers workflow:
@@ -319,6 +355,32 @@ def run_hf_daily_flow(args):
 
             # Generate bilingual summary
             summary_dict = paper_obj.bilingual_summary
+
+            # Fallback: use HF metadata keywords/tags when LLM output misses keywords
+            hf_keywords = _normalize_hf_keywords(
+                p_meta.get("tags") or p_meta.get("keywords")
+            )
+            summary_keywords = summary_dict.get("keywords")
+            if isinstance(summary_keywords, dict):
+                cn_keywords = _normalize_hf_keywords(summary_keywords.get("cn"))
+                en_keywords = _normalize_hf_keywords(summary_keywords.get("en"))
+                if hf_keywords:
+                    if not cn_keywords:
+                        cn_keywords = hf_keywords
+                    if not en_keywords:
+                        en_keywords = hf_keywords
+                summary_dict["keywords"] = {
+                    "cn": list(dict.fromkeys(cn_keywords)),
+                    "en": list(dict.fromkeys(en_keywords)),
+                }
+            else:
+                normalized_keywords = _normalize_hf_keywords(summary_keywords)
+                if not normalized_keywords:
+                    normalized_keywords = hf_keywords
+                summary_dict["keywords"] = {
+                    "cn": normalized_keywords,
+                    "en": normalized_keywords,
+                }
 
             # Extract image
             img_bytes = paper_obj.image_content

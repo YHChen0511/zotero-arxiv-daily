@@ -11,6 +11,7 @@ from loguru import logger
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 import uuid
+import re
 
 framework = """
 <!DOCTYPE HTML>
@@ -137,13 +138,14 @@ def get_hf_block_html(
     problem: str,
     solution: str,
     result: str,
+    keywords: str,
     pdf_url: str,
     code_url: str = None,
     image_cid: str = None,
 ):
     """
     Generate the HTML block for a HuggingFace paper with bilingual content and optional image.
-    problem, solution, result are expected to be HTML strings (with embedded CN/EN styling).
+    problem, solution, result, keywords are expected to be HTML strings.
     """
     code_btn = (
         f'<a href="{code_url}" class="btn-link" style="text-decoration: none; color: #3498db; font-size: 13px; font-weight: 600; margin-left: 10px;">Code</a>'
@@ -189,6 +191,11 @@ def get_hf_block_html(
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
                 <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">🚀 Key Result / 主要结果</span>
                 {result}
+            </div>
+
+            <div class="summary-section" style="margin-bottom: 8px; padding-bottom: 4px;">
+                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">🏷️ Keywords / 关键词</span>
+                {keywords}
             </div>
         </div>
         <div class="paper-footer" style="padding: 12px 20px; background-color: #fdfdfd; border-top: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center;">
@@ -312,7 +319,7 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
     for p in papers:
         # p is expected to be a dict or object with:
         # title, authors (list), score, arxiv_id, pdf_url, code_url
-        # bilingual_summary: { 'problem': {'cn':..., 'en':...}, 'solution':..., 'result':... }
+        # bilingual_summary: { 'problem': ..., 'solution': ..., 'result': ..., 'keywords': ... }
         # image_content: bytes | None
 
         cid = None
@@ -327,6 +334,36 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
             en = data.get("en", "N/A")
             return f'<div class="text-cn">{cn}</div><div class="text-en">{en}</div>'
 
+        def normalize_keywords(raw_value):
+            if isinstance(raw_value, list):
+                candidates = raw_value
+            elif isinstance(raw_value, str):
+                candidates = re.split(r"[,;|/\n，、]+", raw_value)
+            else:
+                return []
+
+            normalized = []
+            for keyword in candidates:
+                text = str(keyword).strip()
+                if text and text.lower() not in {"none", "null", "n/a"}:
+                    normalized.append(text)
+            return normalized
+
+        def format_keywords():
+            data = p.get("bilingual_summary", {}).get("keywords", {})
+
+            if isinstance(data, dict):
+                cn_keywords = normalize_keywords(data.get("cn"))
+                en_keywords = normalize_keywords(data.get("en"))
+            else:
+                shared_keywords = normalize_keywords(data)
+                cn_keywords = shared_keywords
+                en_keywords = shared_keywords
+
+            cn_text = "、".join(cn_keywords) if cn_keywords else "N/A"
+            en_text = ", ".join(en_keywords) if en_keywords else "N/A"
+            return f'<div class="text-cn">{cn_text}</div><div class="text-en">{en_text}</div>'
+
         author_str = ", ".join(p.get("authors", []))
 
         block = get_hf_block_html(
@@ -337,6 +374,7 @@ def render_hf_email(papers: list, date_str: str) -> tuple[str, dict]:
             problem=format_bi("problem"),
             solution=format_bi("solution"),
             result=format_bi("result"),
+            keywords=format_keywords(),
             pdf_url=p.get("pdf_url", "#"),
             code_url=p.get("code_url"),
             image_cid=cid,

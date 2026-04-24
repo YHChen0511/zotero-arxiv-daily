@@ -430,8 +430,8 @@ class ArxivPaper:
     @cached_property
     def bilingual_summary(self) -> dict:
         """
-        Generate a structured bilingual summary (Problem, Solution, Result) using LLM.
-        Returns a dict: {'problem': {'cn':..., 'en':...}, 'solution':..., 'result':...}
+        Generate a structured bilingual summary (Problem, Solution, Result, Keywords) using LLM.
+        Returns a dict with keys: problem, solution, result, keywords, selected_figure.
         """
         introduction = ""
         conclusion = ""
@@ -490,6 +490,7 @@ class ArxivPaper:
         - "problem": {"cn": "...", "en": "..."}  (The specific problem or gap this paper addresses)
         - "solution": {"cn": "...", "en": "..."} (The core method or approach proposed)
         - "result": {"cn": "...", "en": "..."}   (The main results, performance, or contribution)
+        - "keywords": {"cn": ["..."], "en": ["..."]} (3-6 concise research keywords)
         - "selected_figure": "filename" or null (The filename of the most representative figure, e.g. "fig1.pdf", chosen from the provided list based on captions)
         
         Keep the descriptions concise (1-2 sentences each). 
@@ -516,13 +517,46 @@ class ArxivPaper:
             )
             # Attempt to clean markdown if present
             response = response.replace("```json", "").replace("```", "").strip()
-            return json.loads(response)
+            summary = json.loads(response)
+
+            def normalize_keywords(raw_value):
+                if isinstance(raw_value, list):
+                    candidates = raw_value
+                elif isinstance(raw_value, str):
+                    candidates = re.split(r"[,;|/\n，、]+", raw_value)
+                else:
+                    return []
+
+                normalized = []
+                for keyword in candidates:
+                    text = str(keyword).strip()
+                    if text and text.lower() not in {"none", "null", "n/a"}:
+                        normalized.append(text)
+                return normalized
+
+            raw_keywords = summary.get("keywords")
+            if isinstance(raw_keywords, dict):
+                cn_keywords = normalize_keywords(raw_keywords.get("cn"))
+                en_keywords = normalize_keywords(raw_keywords.get("en"))
+                if not cn_keywords and en_keywords:
+                    cn_keywords = en_keywords
+                if not en_keywords and cn_keywords:
+                    en_keywords = cn_keywords
+                summary["keywords"] = {"cn": cn_keywords, "en": en_keywords}
+            elif raw_keywords is None:
+                summary["keywords"] = {"cn": [], "en": []}
+            else:
+                normalized = normalize_keywords(raw_keywords)
+                summary["keywords"] = {"cn": normalized, "en": normalized}
+
+            return summary
         except Exception as e:
             logger.error(
                 f"Failed to generate bilingual summary for {self.arxiv_id}: {e}"
             )
             return {
                 "result": {"cn": "生成失败", "en": "Generation Failed"},
+                "keywords": {"cn": [], "en": []},
                 "selected_figure": None,
             }
 

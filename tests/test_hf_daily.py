@@ -148,3 +148,60 @@ def test_extract_image_content_uses_html_before_pdf_or_source(monkeypatch):
     )
 
     assert hf_daily.extract_image_content(StubPaper()) == b"\x89PNG\r\n\x1a\nhtml"
+
+
+def test_run_hf_daily_flow_uses_hf_metadata_without_arxiv_api_by_default(monkeypatch):
+    sent = []
+    metadata = {
+        "id": "2605.18747",
+        "title": "Code as Agent Harness",
+        "summary": "Survey summary",
+        "authors": [{"name": "Test Author"}],
+        "upvotes": 159,
+    }
+
+    class UnexpectedClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("arXiv API should not be called by default")
+
+        def results(self, search):
+            raise AssertionError("arXiv API should not be called by default")
+
+    monkeypatch.setattr(hf_daily, "get_hf_daily_papers", lambda date: [{"paper": metadata}])
+    monkeypatch.setattr(hf_daily.arxiv, "Client", UnexpectedClient)
+    monkeypatch.setattr(hf_daily, "extract_text_from_html", lambda paper: "full text")
+    monkeypatch.setattr(hf_daily, "extract_text_from_pdf", lambda paper: None)
+    monkeypatch.setattr(hf_daily, "extract_text_from_tar", lambda paper: None)
+    monkeypatch.setattr(hf_daily, "extract_figures_from_html", lambda paper: [])
+    monkeypatch.setattr(hf_daily, "extract_image_content", lambda *a, **kw: None)
+    monkeypatch.setattr(hf_daily, "fetch_code_url", lambda arxiv_id: None)
+    monkeypatch.setattr(
+        hf_daily,
+        "generate_bilingual_summary",
+        lambda **kwargs: {
+            "problem": {"cn": "问题", "en": "Problem"},
+            "solution": {"cn": "方法", "en": "Solution"},
+            "result": {"cn": "结果", "en": "Result"},
+            "keywords": {"cn": [], "en": []},
+            "selected_figure": None,
+        },
+    )
+    monkeypatch.setattr(
+        hf_daily,
+        "send_email",
+        lambda config, html, attachments=None, subject=None: sent.append(
+            (html, attachments, subject)
+        ),
+    )
+
+    config = SimpleNamespace(
+        executor={"hf_date": "2026-05-19", "hf_max_paper_num": 1, "debug": False},
+        llm={},
+    )
+
+    hf_daily.run_hf_daily_flow(config, openai_client=object())
+
+    assert len(sent) == 1
+    html, attachments, subject = sent[0]
+    assert "Code as Agent Harness" in html
+    assert subject == "HuggingFace Daily Papers 2026-05-19"

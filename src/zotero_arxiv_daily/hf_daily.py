@@ -7,6 +7,7 @@ import tarfile
 from datetime import date, timedelta
 from html.parser import HTMLParser
 from time import sleep
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urljoin
 
@@ -52,6 +53,27 @@ ARCHITECTURE_FIGURE_KEYWORDS = {
     "workflow": 4,
     "overall": 4,
 }
+
+
+class HfArxivPaper:
+    def __init__(self, metadata: dict[str, Any], arxiv_id: str):
+        self._arxiv_id = arxiv_id
+        self.title = str(metadata.get("title") or arxiv_id)
+        self.summary = str(
+            metadata.get("summary") or metadata.get("ai_summary") or ""
+        )
+        self.authors = [
+            SimpleNamespace(name=name)
+            for name in _extract_hf_author_names(metadata)
+        ]
+        self.entry_id = f"https://arxiv.org/abs/{arxiv_id}"
+        self.pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+
+    def get_short_id(self) -> str:
+        return self._arxiv_id
+
+    def source_url(self) -> str:
+        return f"https://arxiv.org/e-print/{self._arxiv_id}"
 
 
 def get_hf_daily_papers(date_str: str) -> list[dict[str, Any]]:
@@ -101,6 +123,18 @@ def normalize_hf_keywords(raw_value: Any) -> list[str]:
 
 def normalize_arxiv_id(arxiv_id: str) -> str:
     return re.sub(r"v\d+$", "", str(arxiv_id).strip())
+
+
+def _extract_hf_author_names(metadata: dict[str, Any]) -> list[str]:
+    names = []
+    for author in metadata.get("authors") or []:
+        if isinstance(author, dict):
+            name = author.get("name")
+        else:
+            name = str(author)
+        if name:
+            names.append(str(name))
+    return names
 
 
 def fetch_code_url(arxiv_id: str) -> str | None:
@@ -649,11 +683,11 @@ Paper content:
 
 
 def convert_arxiv_result_to_paper(raw_paper: arxiv.Result) -> Paper:
-    full_text = extract_text_from_tar(raw_paper)
-    if full_text is None:
-        full_text = extract_text_from_html(raw_paper)
+    full_text = extract_text_from_html(raw_paper)
     if full_text is None:
         full_text = extract_text_from_pdf(raw_paper)
+    if full_text is None:
+        full_text = extract_text_from_tar(raw_paper)
     return Paper(
         source="huggingface",
         title=raw_paper.title,
@@ -663,6 +697,24 @@ def convert_arxiv_result_to_paper(raw_paper: arxiv.Result) -> Paper:
         pdf_url=raw_paper.pdf_url,
         full_text=full_text,
     )
+
+
+def convert_hf_metadata_to_paper(
+    metadata: dict[str, Any],
+    arxiv_id: str,
+    raw_paper: arxiv.Result | HfArxivPaper | None = None,
+) -> tuple[Paper, arxiv.Result | HfArxivPaper]:
+    paper_source = raw_paper or HfArxivPaper(metadata, arxiv_id)
+    paper = convert_arxiv_result_to_paper(paper_source)
+
+    if not paper.title or paper.title == arxiv_id:
+        paper.title = str(metadata.get("title") or arxiv_id)
+    if not paper.abstract:
+        paper.abstract = str(metadata.get("summary") or metadata.get("ai_summary") or "")
+    if not paper.authors:
+        paper.authors = _extract_hf_author_names(metadata)
+
+    return paper, paper_source
 
 
 def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
@@ -692,20 +744,7 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
         logger.info("No valid arXiv IDs found in HuggingFace daily papers.")
         return
 
-    client = arxiv.Client(num_retries=5, delay_seconds=10)
-    unique_arxiv_ids = list(dict.fromkeys(arxiv_id for _, arxiv_id in hf_items))
-    arxiv_results: dict[str, arxiv.Result] = {}
-    for i in tqdm(range(0, len(unique_arxiv_ids), 20), desc="Fetching HF arXiv metadata"):
-        batch_ids = unique_arxiv_ids[i : i + 20]
-        try:
-            results = list(client.results(arxiv.Search(id_list=batch_ids)))
-        except Exception as exc:
-            logger.error(f"Failed to fetch arXiv metadata for {batch_ids}: {exc}")
-            continue
-        for result in results:
-            short_id = result.get_short_id()
-            arxiv_results[short_id] = result
-            arxiv_results[normalize_arxiv_id(short_id)] = result
+    logger.info("Using HuggingFace paper metadata directly.")
 
     if openai_client is None:
         openai_client = OpenAI(
@@ -716,14 +755,13 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
     processed_papers = []
     for metadata, arxiv_id in tqdm(hf_items, desc="Processing HF papers"):
         normalized_id = normalize_arxiv_id(arxiv_id)
-        raw_paper = arxiv_results.get(arxiv_id) or arxiv_results.get(normalized_id)
-        if raw_paper is None:
-            logger.warning(f"arXiv ID {arxiv_id} not found in arXiv API.")
-            continue
 
         try:
-            paper = convert_arxiv_result_to_paper(raw_paper)
-            html_figures = extract_figures_from_html(raw_paper)
+            paper, paper_source = convert_hf_metadata_to_paper(
+                metadata,
+                normalized_id,
+            )
+            html_figures = extract_figures_from_html(paper_source)
             tex_figures = _extract_figures_from_tex(paper.full_text or "")
             figures = html_figures + tex_figures
             hf_keywords = normalize_hf_keywords(
@@ -737,7 +775,7 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
                 figures=figures,
             )
             image_content = extract_image_content(
-                raw_paper,
+                paper_source,
                 summary.get("selected_figure"),
                 html_figures=html_figures,
             )

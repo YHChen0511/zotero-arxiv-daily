@@ -4,11 +4,11 @@ import io
 import json
 import re
 import tarfile
-from contextlib import ExitStack
 from datetime import date, timedelta
-from tempfile import TemporaryDirectory
+from html.parser import HTMLParser
+from time import sleep
 from typing import Any
-from urllib.error import HTTPError
+from urllib.parse import urljoin
 
 import arxiv
 import pymupdf
@@ -30,6 +30,28 @@ from .utils import send_email
 
 
 HF_DAILY_API = "https://huggingface.co/api/daily_papers"
+SOURCE_DOWNLOAD_TIMEOUT = (10, 120)
+SOURCE_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+SOURCE_DOWNLOAD_RETRIES = 4
+SOURCE_RETRY_STATUSES = {429, 500, 502, 503, 504}
+ARXIV_REQUEST_HEADERS = {"User-Agent": "zotero-arxiv-daily/1.0"}
+FIGURE_DOWNLOAD_TIMEOUT = (10, 60)
+PDF_DOWNLOAD_TIMEOUT = (10, 120)
+ARCHITECTURE_FIGURE_KEYWORDS = {
+    "architecture": 8,
+    "model architecture": 10,
+    "framework": 8,
+    "pipeline": 8,
+    "overview": 7,
+    "method": 6,
+    "approach": 5,
+    "network": 5,
+    "module": 4,
+    "system": 4,
+    "schematic": 4,
+    "workflow": 4,
+    "overall": 4,
+}
 
 
 def get_hf_daily_papers(date_str: str) -> list[dict[str, Any]]:
@@ -128,26 +150,334 @@ def _extract_figures_from_tex(content: str) -> list[dict[str, str]]:
     return figures
 
 
+class _ArxivHtmlFigureParser(HTMLParser):
+    def __init__(self, base_url: str):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.figures: list[dict[str, str]] = []
+        self._figure_depth = 0
+        self._figcaption_depth = 0
+        self._caption_parts: list[str] = []
+        self._images: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        tag = tag.lower()
+        if tag == "figure":
+            if self._figure_depth == 0:
+                self._caption_parts = []
+                self._images = []
+            self._figure_depth += 1
+        elif self._figure_depth and tag == "figcaption":
+            self._figcaption_depth += 1
+        elif self._figure_depth and tag == "img":
+            src = attr_map.get("src")
+            if src:
+                self._images.append(
+                    {
+                        "file": src,
+                        "url": urljoin(self.base_url, src),
+                        "caption": attr_map.get("alt", ""),
+                    }
+                )
+
+    def handle_data(self, data: str) -> None:
+        if self._figcaption_depth:
+            self._caption_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "figcaption" and self._figcaption_depth:
+            self._figcaption_depth -= 1
+        elif tag == "figure" and self._figure_depth:
+            self._figure_depth -= 1
+            if self._figure_depth == 0:
+                caption = re.sub(r"\s+", " ", " ".join(self._caption_parts)).strip()
+                for image in self._images:
+                    self.figures.append(
+                        {
+                            "file": image["file"],
+                            "url": image["url"],
+                            "caption": caption or image["caption"],
+                            "source": "html",
+                        }
+                    )
+
+
+def _html_url_for_paper(paper: arxiv.Result) -> str:
+    return paper.entry_id.replace("/abs/", "/html/")
+
+
+def extract_figures_from_html(paper: arxiv.Result) -> list[dict[str, str]]:
+    html_url = _html_url_for_paper(paper)
+    try:
+        response = requests.get(
+            html_url,
+            timeout=FIGURE_DOWNLOAD_TIMEOUT,
+            headers=ARXIV_REQUEST_HEADERS,
+        )
+        if response.status_code == 404:
+            return []
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.debug(f"Failed to fetch arXiv HTML figures for {_source_paper_id(paper)}: {exc}")
+        return []
+
+    parser = _ArxivHtmlFigureParser(html_url)
+    try:
+        parser.feed(response.text)
+    except Exception as exc:
+        logger.debug(f"Failed to parse arXiv HTML figures for {_source_paper_id(paper)}: {exc}")
+        return []
+    return parser.figures
+
+
+def _score_figure_candidate(figure: dict[str, str], index: int) -> int:
+    text = f"{figure.get('caption', '')} {figure.get('file', '')}".lower()
+    score = 0
+    for keyword, weight in ARCHITECTURE_FIGURE_KEYWORDS.items():
+        if keyword in text:
+            score += weight
+
+    figure_number = re.search(r"\bfig(?:ure)?\.?\s*(\d+)\b", text)
+    if figure_number:
+        number = int(figure_number.group(1))
+        if number == 1:
+            score += 4
+        elif number == 2:
+            score += 2
+
+    if index < 3:
+        score += 3 - index
+
+    if any(word in text for word in ("appendix", "supplementary", "dataset", "benchmark")):
+        score -= 3
+
+    return score
+
+
+def _select_best_figure(figures: list[dict[str, str]]) -> dict[str, str] | None:
+    if not figures:
+        return None
+    return max(
+        enumerate(figures),
+        key=lambda indexed: _score_figure_candidate(indexed[1], indexed[0]),
+    )[1]
+
+
+def _is_embeddable_image(content: bytes) -> bool:
+    return content.startswith(b"\x89PNG\r\n\x1a\n") or content.startswith(b"\xff\xd8\xff")
+
+
+def _download_figure_image(url: str) -> bytes | None:
+    try:
+        response = requests.get(
+            url,
+            timeout=FIGURE_DOWNLOAD_TIMEOUT,
+            headers=ARXIV_REQUEST_HEADERS,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.debug(f"Failed to download figure image {url}: {exc}")
+        return None
+
+    content = response.content
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "application/pdf" in content_type or url.lower().split("?")[0].endswith(".pdf"):
+        return _pdf_bytes_to_png(content)
+    if _is_embeddable_image(content):
+        return content
+    logger.debug(f"Skipping unsupported figure image type from {url}: {content_type}")
+    return None
+
+
+def extract_image_content_from_html(
+    paper: arxiv.Result,
+    selected_figure: str | None = None,
+    figures: list[dict[str, str]] | None = None,
+) -> bytes | None:
+    figures = figures if figures is not None else extract_figures_from_html(paper)
+    if not figures:
+        return None
+
+    selected = None
+    if selected_figure:
+        selected_base = selected_figure.split("/")[-1]
+        selected = next(
+            (
+                figure
+                for figure in figures
+                if figure.get("file", "").split("/")[-1] == selected_base
+            ),
+            None,
+        )
+
+    if selected is None:
+        selected = _select_best_figure(figures)
+
+    if selected is None or not selected.get("url"):
+        return None
+    return _download_figure_image(selected["url"])
+
+
+def _download_pdf_bytes(paper: arxiv.Result) -> bytes | None:
+    if not paper.pdf_url:
+        return None
+    try:
+        response = requests.get(
+            paper.pdf_url,
+            timeout=PDF_DOWNLOAD_TIMEOUT,
+            headers=ARXIV_REQUEST_HEADERS,
+        )
+        response.raise_for_status()
+        return response.content
+    except requests.RequestException as exc:
+        logger.debug(f"Failed to download PDF for {_source_paper_id(paper)}: {exc}")
+        return None
+
+
+def _score_pdf_page_for_architecture(page: pymupdf.Page, page_index: int) -> int:
+    text = page.get_text("text").lower()
+    score = 0
+    for keyword, weight in ARCHITECTURE_FIGURE_KEYWORDS.items():
+        if keyword in text:
+            score += weight
+    if re.search(r"\bfig(?:ure)?\.?\s*1\b", text):
+        score += 4
+    if re.search(r"\bfig(?:ure)?\.?\s*2\b", text):
+        score += 2
+    score += max(0, 4 - page_index)
+    return score
+
+
+def extract_image_content_from_pdf(paper: arxiv.Result) -> bytes | None:
+    pdf_bytes = _download_pdf_bytes(paper)
+    if pdf_bytes is None:
+        return None
+
+    try:
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        if document.page_count == 0:
+            return None
+        max_pages = min(document.page_count, 4)
+        best_index = max(
+            range(max_pages),
+            key=lambda index: _score_pdf_page_for_architecture(
+                document.load_page(index),
+                index,
+            ),
+        )
+        page = document.load_page(best_index)
+        rect = page.rect
+        clip = pymupdf.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.72)
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=clip)
+        return pixmap.tobytes("png")
+    except Exception as exc:
+        logger.debug(f"Failed to extract PDF figure for {_source_paper_id(paper)}: {exc}")
+        return None
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    retry_after = getattr(response, "headers", {}).get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return max(float(retry_after), 0)
+    except ValueError:
+        return None
+
+
+def _source_paper_id(paper: arxiv.Result) -> str:
+    try:
+        return paper.get_short_id()
+    except Exception:
+        return getattr(paper, "entry_id", "unknown")
+
+
 def _extract_source_archive_content(paper: arxiv.Result) -> bytes | None:
-    with ExitStack() as stack:
-        tmpdirname = stack.enter_context(TemporaryDirectory())
+    paper_id = _source_paper_id(paper)
+    try:
+        source_url = paper.source_url()
+    except Exception as exc:
+        logger.warning(f"Failed to get source URL for {paper_id}: {exc}")
+        return None
+
+    if source_url is None:
+        logger.warning(f"No source URL available for {paper_id}.")
+        return None
+
+    for attempt in range(SOURCE_DOWNLOAD_RETRIES):
         try:
-            source_path = paper.download_source(dirpath=tmpdirname)
-        except HTTPError as exc:
-            if exc.code == 404:
-                logger.warning(f"Source for {paper.get_short_id()} not found.")
+            with requests.get(
+                source_url,
+                stream=True,
+                timeout=SOURCE_DOWNLOAD_TIMEOUT,
+                headers=ARXIV_REQUEST_HEADERS,
+            ) as response:
+                if response.status_code == 404:
+                    logger.warning(f"Source for {paper_id} not found.")
+                    return None
+
+                if (
+                    response.status_code in SOURCE_RETRY_STATUSES
+                    and attempt < SOURCE_DOWNLOAD_RETRIES - 1
+                ):
+                    wait = _retry_after_seconds(response) or 5 * (attempt + 1)
+                    logger.warning(
+                        f"arXiv source download returned HTTP {response.status_code} "
+                        f"for {paper_id}; retrying in {wait:.0f}s"
+                    )
+                    sleep(wait)
+                    continue
+
+                response.raise_for_status()
+                buffer = io.BytesIO()
+                for chunk in response.iter_content(chunk_size=SOURCE_DOWNLOAD_CHUNK_SIZE):
+                    if chunk:
+                        buffer.write(chunk)
+
+                content = buffer.getvalue()
+                expected_size = response.headers.get("Content-Length")
+                if expected_size is not None and len(content) != int(expected_size):
+                    raise requests.exceptions.ChunkedEncodingError(
+                        f"retrieval incomplete: got only {len(content)} "
+                        f"out of {expected_size} bytes"
+                    )
+
+                return content
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 404:
+                logger.warning(f"Source for {paper_id} not found.")
                 return None
-            raise
-        except Exception as exc:
-            logger.warning(f"Error when downloading source for {paper.get_short_id()}: {exc}")
+
+            if status_code in SOURCE_RETRY_STATUSES and attempt < SOURCE_DOWNLOAD_RETRIES - 1:
+                response = exc.response
+                wait = (_retry_after_seconds(response) if response is not None else None) or 5 * (
+                    attempt + 1
+                )
+                logger.warning(
+                    f"arXiv source download returned HTTP {status_code} for {paper_id}; "
+                    f"retrying in {wait:.0f}s"
+                )
+                sleep(wait)
+                continue
+
+            logger.warning(f"Error when downloading source for {paper_id}: {exc}")
+            return None
+        except (requests.RequestException, ValueError) as exc:
+            if attempt < SOURCE_DOWNLOAD_RETRIES - 1:
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    f"Error when downloading source for {paper_id}: {exc}; "
+                    f"retrying in {wait}s"
+                )
+                sleep(wait)
+                continue
+            logger.warning(f"Error when downloading source for {paper_id}: {exc}")
             return None
 
-        try:
-            with open(source_path, "rb") as file:
-                return file.read()
-        except Exception as exc:
-            logger.warning(f"Error when reading source archive for {paper.get_short_id()}: {exc}")
-            return None
+    return None
 
 
 def _pdf_bytes_to_png(pdf_bytes: bytes) -> bytes | None:
@@ -162,8 +492,22 @@ def _pdf_bytes_to_png(pdf_bytes: bytes) -> bytes | None:
 
 
 def extract_image_content(
-    paper: arxiv.Result, selected_figure: str | None = None
+    paper: arxiv.Result,
+    selected_figure: str | None = None,
+    html_figures: list[dict[str, str]] | None = None,
 ) -> bytes | None:
+    image_content = extract_image_content_from_html(
+        paper,
+        selected_figure=selected_figure,
+        figures=html_figures,
+    )
+    if image_content is not None:
+        return image_content
+
+    image_content = extract_image_content_from_pdf(paper)
+    if image_content is not None:
+        return image_content
+
     source_content = _extract_source_archive_content(paper)
     if source_content is None:
         return None
@@ -227,12 +571,13 @@ def generate_bilingual_summary(
     if paper.full_text:
         context_text += f"Paper content preview: {paper.full_text[:4000]}\n"
 
-    figures_text = "No figures extracted from latex source."
+    figures_text = "No figures extracted from the paper."
     if figures:
         figures_text = (
             "Figures found in paper:\n"
             + json.dumps(figures, ensure_ascii=False, indent=2)
-            + "\nSelect the most representative figure filename in selected_figure."
+            + "\nPrefer an architecture/framework/pipeline/overview figure. "
+            + "Select its file value in selected_figure."
         )
 
     prompt = f"""
@@ -347,7 +692,7 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
         logger.info("No valid arXiv IDs found in HuggingFace daily papers.")
         return
 
-    client = arxiv.Client()
+    client = arxiv.Client(num_retries=5, delay_seconds=10)
     unique_arxiv_ids = list(dict.fromkeys(arxiv_id for _, arxiv_id in hf_items))
     arxiv_results: dict[str, arxiv.Result] = {}
     for i in tqdm(range(0, len(unique_arxiv_ids), 20), desc="Fetching HF arXiv metadata"):
@@ -378,7 +723,9 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
 
         try:
             paper = convert_arxiv_result_to_paper(raw_paper)
-            figures = _extract_figures_from_tex(paper.full_text or "")
+            html_figures = extract_figures_from_html(raw_paper)
+            tex_figures = _extract_figures_from_tex(paper.full_text or "")
+            figures = html_figures + tex_figures
             hf_keywords = normalize_hf_keywords(
                 metadata.get("tags") or metadata.get("keywords")
             )
@@ -389,7 +736,11 @@ def run_hf_daily_flow(config: Any, openai_client: OpenAI | None = None) -> None:
                 hf_keywords=hf_keywords,
                 figures=figures,
             )
-            image_content = extract_image_content(raw_paper, summary.get("selected_figure"))
+            image_content = extract_image_content(
+                raw_paper,
+                summary.get("selected_figure"),
+                html_figures=html_figures,
+            )
 
             processed_papers.append(
                 {

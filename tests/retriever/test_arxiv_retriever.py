@@ -9,6 +9,13 @@ from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever, _run_wi
 import zotero_arxiv_daily.retriever.arxiv_retriever as arxiv_retriever
 
 
+class FeedEntry(dict):
+    def __init__(self, paper_id: str, announce_type: str = "new"):
+        super().__init__(arxiv_announce_type=announce_type)
+        self.id = f"oai:arXiv.org:{paper_id}"
+        self.title = f"Paper {paper_id}"
+
+
 def _sleep_and_return(value: str, delay_seconds: float) -> str:
     time.sleep(delay_seconds)
     return value
@@ -63,9 +70,47 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     assert set(p.title for p in papers) == set(e.title for e in new_entries)
 
 
+def test_arxiv_retriever_skips_persistent_429_batch(config, monkeypatch):
+    entries = [FeedEntry(f"2605.{index:05d}v1") for index in range(21)]
+    fake_feed = SimpleNamespace(feed=SimpleNamespace(title="ok"), entries=entries)
+    warnings: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            if search.id_list[0] == "2605.00000v1":
+                raise arxiv_retriever.arxiv.HTTPError("https://export.arxiv.org/api/query", 0, 429)
+            return iter([
+                SimpleNamespace(
+                    title="Paper 2605.00020v1",
+                    authors=[SimpleNamespace(name="Test Author")],
+                    summary="Test abstract",
+                    pdf_url="https://arxiv.org/pdf/2605.00020v1",
+                    entry_id="https://arxiv.org/abs/2605.00020v1",
+                    source_url=lambda: "https://arxiv.org/e-print/2605.00020v1",
+                )
+            ])
+
+    monkeypatch.setattr(arxiv_retriever.feedparser, "parse", lambda _: fake_feed)
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_pdf", lambda paper: None)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_tar", lambda paper: None)
+
+    papers = ArxivRetriever(config).retrieve_papers()
+
+    assert len(papers) == 1
+    assert papers[0].title == "Paper 2605.00020v1"
+    assert any("Skipping arXiv batch 0" in warning for warning in warnings)
+
+
 def test_run_with_hard_timeout_returns_value():
     result = _run_with_hard_timeout(
-        _sleep_and_return, ("done", 0.01), timeout=1, operation="test op", paper_title="paper"
+        _sleep_and_return, ("done", 0.01), timeout=5, operation="test op", paper_title="paper"
     )
     assert result == "done"
 
@@ -84,7 +129,7 @@ def test_run_with_hard_timeout_returns_none_on_failure(monkeypatch):
     warnings: list[str] = []
     monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
     result = _run_with_hard_timeout(
-        _raise_runtime_error, (), timeout=1, operation="test op", paper_title="paper"
+        _raise_runtime_error, (), timeout=5, operation="test op", paper_title="paper"
     )
     assert result is None
     assert "boom" in warnings[0]

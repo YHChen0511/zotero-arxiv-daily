@@ -177,15 +177,15 @@ def get_hf_block_html(
             {image_html}
 
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
-                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Problem / Background</span>
+                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Quick Read / Problem</span>
                 {problem}
             </div>
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
-                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Solution / Method</span>
+                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Method / Evidence</span>
                 {solution}
             </div>
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
-                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Key Result</span>
+                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Decision / Follow-up</span>
                 {result}
             </div>
         </div>

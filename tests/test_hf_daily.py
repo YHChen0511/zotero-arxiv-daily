@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pymupdf
 import requests
 
 import zotero_arxiv_daily.hf_daily as hf_daily
@@ -128,6 +129,33 @@ def test_extract_image_content_from_html_prefers_architecture_caption(monkeypatc
 
     assert image == png_bytes
     assert requested_urls == ["https://arxiv.org/html/arch.png"]
+
+
+def test_select_pdf_figure_clip_uses_image_and_caption_region():
+    document = pymupdf.open()
+    page = document.new_page(width=600, height=800)
+    image_rect = pymupdf.Rect(100, 120, 500, 360)
+    caption_rect = pymupdf.Rect(100, 365, 500, 430)
+    page.insert_image(
+        image_rect,
+        stream=(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?\x00\x05"
+            b"\xfe\x02\xfeA\xe2%\x9b\x00\x00\x00\x00IEND\xaeB`\x82"
+        ),
+    )
+    page.insert_textbox(caption_rect, "Figure 1: Overall model architecture.", fontsize=12)
+
+    selected = hf_daily._select_pdf_figure_clip(document, max_pages=1)
+
+    assert selected is not None
+    _, clip = selected
+    assert clip.x0 <= image_rect.x0
+    assert clip.y0 <= image_rect.y0
+    assert clip.x1 >= image_rect.x1
+    assert clip.y1 >= caption_rect.y0
+    assert clip.height < page.rect.height * 0.5
 
 
 def test_extract_image_content_uses_html_before_pdf_or_source(monkeypatch):

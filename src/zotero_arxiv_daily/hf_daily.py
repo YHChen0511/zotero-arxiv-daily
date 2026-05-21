@@ -38,6 +38,10 @@ SOURCE_RETRY_STATUSES = {429, 500, 502, 503, 504}
 ARXIV_REQUEST_HEADERS = {"User-Agent": "zotero-arxiv-daily/1.0"}
 FIGURE_DOWNLOAD_TIMEOUT = (10, 60)
 PDF_DOWNLOAD_TIMEOUT = (10, 120)
+PDF_RENDER_SCALE = 2
+PDF_MAX_FALLBACK_PAGES = 4
+PDF_FALLBACK_PAGE_HEIGHT_RATIO = 0.72
+PDF_FIGURE_MARGIN = 12
 ARCHITECTURE_FIGURE_KEYWORDS = {
     "architecture": 8,
     "model architecture": 10,
@@ -384,6 +388,133 @@ def _score_pdf_page_for_architecture(page: pymupdf.Page, page_index: int) -> int
     return score
 
 
+def _rect_from_bbox(page: pymupdf.Page, bbox: tuple[float, float, float, float]) -> pymupdf.Rect:
+    page_rect = page.rect
+    x0, y0, x1, y1 = bbox
+    return pymupdf.Rect(
+        max(page_rect.x0, x0),
+        max(page_rect.y0, y0),
+        min(page_rect.x1, x1),
+        min(page_rect.y1, y1),
+    )
+
+
+def _expand_rect(page: pymupdf.Page, rect: pymupdf.Rect, margin: float) -> pymupdf.Rect:
+    return _rect_from_bbox(
+        page,
+        (
+            rect.x0 - margin,
+            rect.y0 - margin,
+            rect.x1 + margin,
+            rect.y1 + margin,
+        ),
+    )
+
+
+def _text_from_block(block: dict[str, Any]) -> str:
+    text_parts = []
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            text_parts.append(str(span.get("text", "")))
+    return " ".join(text_parts)
+
+
+def _score_caption(text: str) -> int:
+    normalized = text.lower()
+    score = 0
+    if re.search(r"\bfig(?:ure)?\.?\s*\d+\b", normalized):
+        score += 8
+    for keyword, weight in ARCHITECTURE_FIGURE_KEYWORDS.items():
+        if keyword in normalized:
+            score += weight
+    return score
+
+
+def _rects_overlap_horizontally(left: pymupdf.Rect, right: pymupdf.Rect) -> bool:
+    overlap = min(left.x1, right.x1) - max(left.x0, right.x0)
+    return overlap > min(left.width, right.width) * 0.25
+
+
+def _nearest_caption_rect(
+    image_rect: pymupdf.Rect,
+    text_blocks: list[dict[str, Any]],
+    page: pymupdf.Page,
+) -> tuple[pymupdf.Rect | None, int]:
+    best_rect = None
+    best_score = 0
+    max_gap = page.rect.height * 0.18
+
+    for block in text_blocks:
+        text = _text_from_block(block)
+        score = _score_caption(text)
+        if score == 0:
+            continue
+
+        text_rect = _rect_from_bbox(page, block["bbox"])
+        if not _rects_overlap_horizontally(image_rect, text_rect):
+            continue
+
+        vertical_gap = min(
+            abs(text_rect.y0 - image_rect.y1),
+            abs(image_rect.y0 - text_rect.y1),
+        )
+        if vertical_gap > max_gap:
+            continue
+
+        score -= int(vertical_gap / 20)
+        if score > best_score:
+            best_rect = text_rect
+            best_score = score
+
+    return best_rect, best_score
+
+
+def _select_pdf_figure_clip(
+    document: pymupdf.Document,
+    max_pages: int,
+) -> tuple[pymupdf.Page, pymupdf.Rect] | None:
+    best: tuple[int, pymupdf.Page, pymupdf.Rect] | None = None
+
+    for page_index in range(max_pages):
+        page = document.load_page(page_index)
+        page_area = page.rect.width * page.rect.height
+        if page_area <= 0:
+            continue
+
+        blocks = page.get_text("dict").get("blocks", [])
+        text_blocks = [block for block in blocks if block.get("type") == 0 and block.get("bbox")]
+        image_blocks = [
+            block
+            for block in blocks
+            if block.get("type") == 1
+            and block.get("bbox")
+            and pymupdf.Rect(block["bbox"]).width * pymupdf.Rect(block["bbox"]).height
+            >= page_area * 0.02
+        ]
+        page_score = _score_pdf_page_for_architecture(page, page_index)
+
+        for block in image_blocks:
+            image_rect = _rect_from_bbox(page, block["bbox"])
+            area_ratio = (image_rect.width * image_rect.height) / page_area
+            score = page_score + int(area_ratio * 80)
+            if image_rect.y0 < page.rect.y0 + page.rect.height * 0.65:
+                score += 4
+
+            caption_rect, caption_score = _nearest_caption_rect(image_rect, text_blocks, page)
+            clip = image_rect
+            score += caption_score
+            if caption_rect is not None:
+                clip = clip | caption_rect
+
+            clip = _expand_rect(page, clip, PDF_FIGURE_MARGIN)
+            if best is None or score > best[0]:
+                best = (score, page, clip)
+
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def extract_image_content_from_pdf(paper: arxiv.Result) -> bytes | None:
     pdf_bytes = _download_pdf_bytes(paper)
     if pdf_bytes is None:
@@ -393,18 +524,33 @@ def extract_image_content_from_pdf(paper: arxiv.Result) -> bytes | None:
         document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         if document.page_count == 0:
             return None
-        max_pages = min(document.page_count, 4)
-        best_index = max(
-            range(max_pages),
-            key=lambda index: _score_pdf_page_for_architecture(
-                document.load_page(index),
-                index,
-            ),
+        max_pages = min(document.page_count, PDF_MAX_FALLBACK_PAGES)
+        selected = _select_pdf_figure_clip(document, max_pages)
+        if selected is None:
+            best_index = max(
+                range(max_pages),
+                key=lambda index: _score_pdf_page_for_architecture(
+                    document.load_page(index),
+                    index,
+                ),
+            )
+            page = document.load_page(best_index)
+            rect = page.rect
+            selected = (
+                page,
+                pymupdf.Rect(
+                    rect.x0,
+                    rect.y0,
+                    rect.x1,
+                    rect.y0 + rect.height * PDF_FALLBACK_PAGE_HEIGHT_RATIO,
+                ),
+            )
+
+        page, clip = selected
+        pixmap = page.get_pixmap(
+            matrix=pymupdf.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE),
+            clip=clip,
         )
-        page = document.load_page(best_index)
-        rect = page.rect
-        clip = pymupdf.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.72)
-        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=clip)
         return pixmap.tobytes("png")
     except Exception as exc:
         logger.debug(f"Failed to extract PDF figure for {_source_paper_id(paper)}: {exc}")

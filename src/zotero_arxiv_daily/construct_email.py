@@ -185,7 +185,7 @@ def get_hf_block_html(
                 {solution}
             </div>
             <div class="summary-section" style="margin-bottom: 16px; border-bottom: 1px solid #f9f9f9; padding-bottom: 12px;">
-                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Decision / Follow-up</span>
+                <span class="summary-label" style="display: block; font-size: 11px; font-weight: 700; color: #95a5a6; text-transform: uppercase; margin-bottom: 6px;">Results / Limits</span>
                 {result}
             </div>
         </div>

@@ -761,8 +761,8 @@ def generate_bilingual_summary(
         )
 
     prompt = f"""
-Analyze the following academic paper as a research assistant. The goal is to help
-the reader quickly decide whether this HF Daily paper deserves deeper follow-up.
+Analyze the following academic paper as a research assistant. Focus only on
+paper analysis. Do not make reading-priority recommendations.
 
 Return a valid JSON object with these keys:
 - "problem": {{"cn": "...", "en": "..."}}
@@ -777,10 +777,9 @@ Field meaning:
 - solution: combine method delta, evidence quality, and hidden assumptions. Say
   what changed versus the closest prior work, whether the experiments support
   the claim, and what assumptions the method depends on.
-- result: combine reading decision and research follow-up. Include whether to
-  add it to a deep-reading list (yes/no/maybe), reproduction difficulty, three
-  follow-up ideas, and risk scores for novelty, reliability, and practicality
-  on a 1-5 scale.
+- result: summarize the main empirical or theoretical results, contributions,
+  limitations, and reproducibility notes that are supported by the provided
+  text.
 
 Keep each field concise but information-dense. Distinguish paper claims from
 your inference. If evidence is missing from the provided text, say so. Do not
